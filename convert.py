@@ -45,6 +45,7 @@ import csv
 import json
 import html
 import hashlib
+import difflib
 import argparse
 import unicodedata
 
@@ -335,22 +336,58 @@ _ABS_LABELS = (r'Background|Objectives?|Purpose|Aims?|Introduction|Importance|'
                r'Conclusions?|Interpretation')
 
 
+_MONTHS = (r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+           r'Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|'
+           r'Dec(?:ember)?)')
+
+
+def _strip_article_history(text):
+    """Remove Elsevier 'Article history' column bleed (Received/Accepted/dates)
+    that gets interleaved into two-column abstracts during extraction."""
+    text = re.sub(r'\b(?:Received(?: in revised form)?|Accepted|Available online)\b',
+                  ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b\d{1,2}\s+' + _MONTHS + r'\s+\d{4}\b', ' ', text)
+    return re.sub(r'\s{2,}', ' ', text).strip()
+
+
 def extract_abstract(md_text):
-    """Extract the abstract, preserving structured labels on their own lines."""
+    """Extract the abstract, preserving structured labels on their own lines.
+
+    Layouts, in priority order: explicit 'Abstract'/'Summary' heading; inline
+    'Abstract:' label; headerless structured abstract (Background/…); the Elsevier
+    two-column 'article info | Article history:' layout where the abstract's
+    labels bleed inline; and the BMJ Open layout where the abstract sits under
+    'Introduction' after a 'Strengths and limitations of this study' box. The
+    last two are additive fallbacks — they run only when the first three fail,
+    so papers that already parse are unaffected.
+    """
     head = re.sub(r'A\s+B\s+S\s+T\s+R\s+A\s+C\s+T', 'Abstract',
                   md_text[:9000], flags=re.IGNORECASE)
     patterns = [
-        r'(?:^|\n)\s*#{0,3}\s*\**\s*(?:Abstract|Summary)\s*\**\s*[:.\-—]?\s*\n+(.*?)'
-        r'(?=\n\s*#{1,3}\s|\n\s*\**\s*(?:Introduction|Keywords|©)\b|\n\s*\**\s*\d+\.\s)',
-        r'(?:^|\n)\s*\**\s*(?:Abstract|Summary)\s*\**\s*[-—:.]\s*(.*?)'
-        r'(?=\n\s*\**\s*(?:Introduction|Keywords|©)\b|\n\s*\**\s*\d+\.\s)',
-        r'(?:^|\n)((?:\**\s*)?(?:Background|Objectives?|Purpose|Aims?|Importance)\s*\**\s*[:.\-—].*?)'
-        r'(?=\n\s*#{1,3}\s|\n\s*\**\s*Keywords|©|\Z)',
+        ('heading',
+         r'(?:^|\n)\s*#{0,3}\s*\**\s*(?:Abstract|Summary)\s*\**\s*[:.\-—]?\s*\n+(.*?)'
+         r'(?=\n\s*#{1,3}\s|\n\s*\**\s*(?:Introduction|Keywords|©)\b|\n\s*\**\s*\d+\.\s)'),
+        ('inline',
+         r'(?:^|\n)\s*\**\s*(?:Abstract|Summary)\s*\**\s*[-—:.]\s*(.*?)'
+         r'(?=\n\s*\**\s*(?:Introduction|Keywords|©)\b|\n\s*\**\s*\d+\.\s)'),
+        ('structured',
+         r'(?:^|\n)((?:\**\s*)?(?:Background|Objectives?|Purpose|Aims?|Importance)\s*\**\s*[:.\-—].*?)'
+         r'(?=\n\s*#{1,3}\s|\n\s*\**\s*Keywords|©|\Z)'),
+        # Elsevier two-column layout: labels bleed inline after 'Article history:'
+        ('elsevier',
+         r'Article\s+history:.*?((?:Background|Objectives?|Purpose|Aims?|Importance)\s*[:.\-—].*?)'
+         r'(?=\n\s*\**\s*(?:Keywords|©|Crown Copyright)|\n\s*#{1,3}\s|\Z)'),
+        # BMJ Open: abstract under 'Introduction' after a 'Strengths and limitations' box
+        ('bmj',
+         r'Strengths and limitations of this study\s*\**\s*\n+\s*\**\s*Introduction\**\s*(.*?)'
+         r'(?=\n\s*#{1,3}\s|\Z)'),
     ]
-    for pattern in patterns:
+    for name, pattern in patterns:
         m = re.search(pattern, head, re.IGNORECASE | re.DOTALL)
         if m:
             abstract = re.sub(r'\s+', ' ', m.group(1)).strip()
+            if name == 'elsevier':
+                abstract = _strip_article_history(abstract)
             if len(abstract) > 60:
                 return structure_abstract(abstract[:3200])
     return ""
@@ -401,7 +438,7 @@ _DESIGN_RULES = [
      r'systematic review|cochrane database of systematic reviews|cochrane review'),
     ('Scoping review', r'scoping review'),
     ('Randomized controlled trial',
-     r'randomi[sz]ed controlled trial|randomi[sz]ed clinical trial|'
+     r'randomi[sz]ed(?: controlled| clinical)? trial|'
      r'\brct\b|double-?blind|randomly assigned|placebo-?controlled'),
     ('Case-control study', r'case-?control'),
     ('Cross-sectional study', r'cross-?sectional'),
@@ -426,7 +463,7 @@ _DESIGN_RULES = [
 # Named registry / administrative databases. Their presence — especially in the
 # title — is a strong signal for a retrospective COHORT study (not QI/other).
 _REGISTRY_DB = [
-    ('NSQIP', r'\bnsqip\b|national surgical quality improvement'),
+    ('NSQIP', r'\bnsqip\b|national surg(?:ical|ery) quality improvement'),
     ('VQI', r'\bvqi\b|vascular quality initiative|vascular implant surveillance'),
     ('Medicare/CMS', r'\bmedicare\b|centers for medicare'),
     ('Cerner Health Facts', r'cerner|health facts'),
@@ -496,7 +533,7 @@ def extract_sample_size(abstract, body):
 
 
 _DATA_SOURCES = [
-    ('NSQIP', r'\bnsqip\b|national surgical quality improvement'),
+    ('NSQIP', r'\bnsqip\b|national surg(?:ical|ery) quality improvement'),
     ('VQI', r'\bvqi\b|vascular quality initiative|vascular implant surveillance'),
     ('Medicare/CMS', r'\bmedicare\b|\bcms\b|centers for medicare'),
     ('Cerner Health Facts', r'cerner|health facts'),
@@ -652,6 +689,15 @@ def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separ
         title = emb_title or fname_meta.get('title') or extract_title(md_text)
     else:
         title = fname_meta.get('title') or emb_title or extract_title(md_text)
+    # Prefer the embedded title when it is essentially the same as the filename
+    # title but better formed — repairs dropped-ligature gaps that live in the
+    # filename itself (e.g. "justi ed" -> "justified", "signi cant" -> "significant",
+    # "Limb- Threatening" -> "Limb-Threatening").
+    if (not prefer_pdf_title and emb_title and fname_meta.get('title')
+            and emb_title != title
+            and difflib.SequenceMatcher(None, emb_title.lower(),
+                                        title.lower()).ratio() >= 0.90):
+        title = emb_title
     journal = fname_meta.get('journal', '')
     year = fname_meta.get('year') or extract_year(md_text, original_filename)
     doi = emb_doi or find_doi(page1) or find_doi(md_text[:6000])

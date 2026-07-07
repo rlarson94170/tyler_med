@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .wiki_state.json
+
+# Local reminder/notes file — not part of the skill
+Skill Update Process.rtf
