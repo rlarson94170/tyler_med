@@ -96,6 +96,10 @@ python3 "$HOME/.claude/skills/tyler_med/convert.py" "PDF_DIR" "WIKI_DIR" [OPTION
 - `--keep-references`: keep references inline in each paper file
 - `--drop-references`: discard references entirely (default: save to `references/`)
 - `--force`: re-convert everything, ignoring the incremental cache
+- `--ocr {auto,off,force}`: OCR policy (default `auto`). `auto` OCRs only PDFs that
+  lack an adequate text layer, so born-digital journal PDFs skip the slow Tesseract
+  pass (~4-5x faster per file, identical extraction); `off` never OCRs; `force`
+  always OCRs. Use `off` for a known born-digital set to go fastest.
 - `--time-budget SECONDS`: stop starting new conversions after SECONDS, then exit 0
   with a `PENDING n` line (for time-capped sandboxes — see below)
 - `--index-only`: skip conversion, just rebuild `index.md` + evidence table from the
@@ -142,8 +146,12 @@ thematic (topic) grouping to complement the by-design grouping, or draft a
 narrative synthesis / evidence-table rows from the abstracts.
 
 ## Gotchas and known issues
-- **Scanned PDFs**: text-layer only; scanned images yield near-empty output
-  (flagged <500 bytes). Fix with `ocrmypdf` first.
+- **Scanned PDFs & OCR**: with `--ocr auto` (default) the script samples each PDF's
+  text layer and only runs Tesseract OCR on PDFs that lack one (true scans). Born-
+  digital journal PDFs skip OCR entirely — much faster, with identical extraction.
+  A genuine scan with no text layer still yields near-empty output if OCR can't
+  recover it (flagged <500 bytes); `ocrmypdf` first is the fallback. Use
+  `--ocr force` to OCR everything (old behavior) or `--ocr off` to never OCR.
 - **Heuristic metadata**: study-design, N, and data-source are best-effort from
   the abstract; verify anything load-bearing against the full text. `study_type`
   defaults to "Observational/Other" when no cues match.

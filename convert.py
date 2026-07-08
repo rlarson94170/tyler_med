@@ -223,6 +223,23 @@ def pdf_embedded_meta(pdf_path):
     return title, author, doi, page1
 
 
+def _pdf_needs_ocr(pdf_path, sample_pages=12, min_chars_per_page=100):
+    """Heuristic: a PDF needs OCR only if it lacks an adequate embedded text
+    layer (i.e. it is a scan). Born-digital journal PDFs carry thousands of
+    characters per page and should skip the (slow) Tesseract pass entirely —
+    pymupdf4llm's layout engine otherwise OCRs figure/image pages even when the
+    real text is already present, which is pure wasted time. Returns True only
+    when the sampled text density is too low to trust."""
+    try:
+        import fitz
+        with fitz.open(pdf_path) as d:
+            n = min(sample_pages, d.page_count) or 1
+            chars = sum(len(d[i].get_text()) for i in range(n))
+        return (chars / n) < min_chars_per_page
+    except Exception:
+        return True  # if we cannot tell, allow OCR (safe default)
+
+
 DOI_RE = re.compile(r'\b10\.\d{4,9}/[-._;()/:a-z0-9]+', re.IGNORECASE)
 
 
@@ -667,18 +684,31 @@ def split_references(md_text):
 # ---------------------------------------------------------------------------
 
 def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separate',
-                    prefer_pdf_title=False):
+                    prefer_pdf_title=False, ocr_mode='auto'):
     """Convert a single PDF to cleaned markdown + YAML frontmatter.
 
     references_mode: 'separate' (default, write to refs_dir), 'inline' (keep in
     body), or 'drop' (discard).
     prefer_pdf_title: if True, trust the PDF's embedded metadata title ahead of
     the filename (useful for older, badly-named files).
+    ocr_mode: 'auto' (OCR only PDFs without an adequate text layer — the fast
+    default), 'off' (never OCR), or 'force' (always OCR).
     Returns a metadata dict for the index, or raises on failure.
     """
     import pymupdf4llm
 
-    raw = pymupdf4llm.to_markdown(pdf_path)
+    if ocr_mode == 'force':
+        use_ocr = True
+    elif ocr_mode == 'off':
+        use_ocr = False
+    else:  # 'auto'
+        use_ocr = _pdf_needs_ocr(pdf_path)
+    try:
+        raw = pymupdf4llm.to_markdown(pdf_path, use_ocr=use_ocr)
+    except TypeError:
+        # Older/classic pymupdf4llm engine has no `use_ocr` kwarg (and does not
+        # OCR on its own) — fall back to the plain call.
+        raw = pymupdf4llm.to_markdown(pdf_path)
     md_text = repair_text(raw)
     original_filename = os.path.basename(pdf_path)
 
@@ -1019,6 +1049,10 @@ def main():
                         "(useful for older, badly-named files)")
     p.add_argument('--force', action='store_true',
                    help='Re-convert all files, ignoring incremental state')
+    p.add_argument('--ocr', choices=['auto', 'off', 'force'], default='auto',
+                   help="OCR policy: 'auto' (default) OCRs only PDFs that lack an "
+                        "adequate text layer (born-digital journal PDFs skip it, "
+                        "~4-5x faster); 'off' never OCRs; 'force' always OCRs.")
     p.add_argument('--time-budget', type=float, default=None, metavar='SECONDS',
                    help='Stop STARTING new conversions once this many seconds have '
                         'elapsed, then exit 0 with a PENDING count. State is saved '
@@ -1107,7 +1141,8 @@ def main():
         output_path = os.path.join(papers_dir, md_filename)
         try:
             meta = convert_one_pdf(pdf_path, output_path, refs_dir, references_mode,
-                                   prefer_pdf_title=args.prefer_pdf_title)
+                                   prefer_pdf_title=args.prefer_pdf_title,
+                                   ocr_mode=args.ocr)
             if os.path.getsize(output_path) < 500:
                 print(f"  [{i}/{len(pdf_files)}] WARNING (possible scan, little text): {pdf_filename}")
             else:
