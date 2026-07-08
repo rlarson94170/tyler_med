@@ -91,9 +91,15 @@ python3 "$HOME/.claude/skills/tyler_med/convert.py" "PDF_DIR" "WIKI_DIR" [OPTION
 ```
 **Flags:**
 - `--recursive` / `-r`: scan recursively
+- `--prefer-pdf-title`: trust the PDF's embedded metadata title over the filename
+  (best for older, badly-named files)
 - `--keep-references`: keep references inline in each paper file
 - `--drop-references`: discard references entirely (default: save to `references/`)
 - `--force`: re-convert everything, ignoring the incremental cache
+- `--time-budget SECONDS`: stop starting new conversions after SECONDS, then exit 0
+  with a `PENDING n` line (for time-capped sandboxes — see below)
+- `--index-only`: skip conversion, just rebuild `index.md` + evidence table from the
+  cache
 
 The script automatically: finds PDFs (skips unchanged), converts via pymupdf4llm,
 reads embedded metadata + DOI, repairs mojibake, extracts clinical metadata,
@@ -102,6 +108,20 @@ frontmatter, detects duplicates, and builds `index.md` + `index.csv` + `index.js
 
 **Important:** the index and evidence table are built entirely in Python — you do
 NOT need to read individual paper files to build them.
+
+**Resumable runs (time-capped / no-background environments like Cowork):** state is
+saved to `.wiki_state.json` after *every* file, and the index is rebuilt from that
+state each pass, so a run can be interrupted and resumed without losing work. When a
+shell has a hard per-call wall-clock limit and cannot run background processes, pass
+`--time-budget` (e.g. a value comfortably under the cap) and **re-run the exact same
+command** until the output prints `ALL_DONE` instead of `PENDING n`. Each pass skips
+already-converted files and makes forward progress. Example supervisor loop:
+```bash
+until python3 "$HOME/.claude/skills/tyler_med/convert.py" "PDF_DIR" "WIKI_DIR" \
+      --time-budget 30 | tee /dev/stderr | grep -qa ALL_DONE; do :; done
+```
+In the code environment (no wall-clock cap), omit `--time-budget` and it runs in one
+pass as before.
 
 ### Step 3: Report to the user
 Report: PDFs found / converted / skipped / failed; the study-design breakdown the

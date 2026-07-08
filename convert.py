@@ -44,6 +44,7 @@ import re
 import csv
 import json
 import html
+import time
 import hashlib
 import difflib
 import argparse
@@ -973,6 +974,35 @@ def save_state(state_path, state):
 # Main
 # ---------------------------------------------------------------------------
 
+def _state_key(pdf_path):
+    """Stable, normalized state key (absolute path) so different path forms for
+    the same file don't create duplicate/stale cache entries across environments."""
+    return os.path.abspath(pdf_path)
+
+
+def _done_metadata(pdf_files, state):
+    """Metadata for the current inputs already converted, read from state."""
+    out = []
+    for p in pdf_files:
+        entry = state.get(_state_key(p))
+        if entry and entry.get('metadata'):
+            out.append(entry['metadata'])
+    return out
+
+
+def _rebuild_outputs(pdf_files, state, wiki_dir):
+    """Idempotent (re)build of index.md + evidence table from state. Because it
+    reads from state, it reflects everything converted so far and works after a
+    partial or resumed run."""
+    done = _done_metadata(pdf_files, state)
+    dupes = find_duplicates(done)
+    index_path = os.path.join(wiki_dir, 'index.md')
+    build_index(done, index_path, dupes)
+    build_evidence_table(done, os.path.join(wiki_dir, 'index.csv'),
+                         os.path.join(wiki_dir, 'index.json'), dupes)
+    return done, dupes, index_path
+
+
 def main():
     p = argparse.ArgumentParser(
         description='Convert medical/clinical PDFs to a structured markdown wiki.')
@@ -989,7 +1019,26 @@ def main():
                         "(useful for older, badly-named files)")
     p.add_argument('--force', action='store_true',
                    help='Re-convert all files, ignoring incremental state')
+    p.add_argument('--time-budget', type=float, default=None, metavar='SECONDS',
+                   help='Stop STARTING new conversions once this many seconds have '
+                        'elapsed, then exit 0 with a PENDING count. State is saved '
+                        'per file, so re-run the same command until ALL_DONE. Use '
+                        'this in time-capped sandboxes that cannot run in the '
+                        'background.')
+    p.add_argument('--index-only', action='store_true',
+                   help='Do not convert; just rebuild index.md + evidence table '
+                        'from the existing .wiki_state.json cache, then exit.')
     args = p.parse_args()
+
+    # Preflight: required libraries (fail fast with an actionable message).
+    try:
+        import pymupdf4llm  # noqa: F401
+        import fitz  # noqa: F401  (PyMuPDF)
+    except Exception as e:
+        print(f"ERROR: a required library is not importable ({e}).")
+        print("  Install with:  pip install pymupdf4llm")
+        print("  (sandboxes may need:  pip install pymupdf4llm --break-system-packages)")
+        sys.exit(1)
 
     pdf_dir, wiki_dir = args.pdf_dir, args.wiki_dir
     if not os.path.isdir(pdf_dir):
@@ -1007,77 +1056,94 @@ def main():
     os.makedirs(papers_dir, exist_ok=True)
 
     if args.recursive:
-        pdf_files = [os.path.join(root, f)
+        pdf_files = [os.path.abspath(os.path.join(root, f))
                      for root, _, files in os.walk(pdf_dir)
                      for f in files if f.lower().endswith('.pdf')]
     else:
-        pdf_files = [os.path.join(pdf_dir, f) for f in os.listdir(pdf_dir)
-                     if f.lower().endswith('.pdf')]
+        pdf_files = [os.path.abspath(os.path.join(pdf_dir, f))
+                     for f in os.listdir(pdf_dir) if f.lower().endswith('.pdf')]
     if not pdf_files:
         print(f"No PDF files found in: {pdf_dir}")
         sys.exit(0)
     pdf_files.sort()
-    print(f"Found {len(pdf_files)} PDF files.\n")
 
     state_path = os.path.join(wiki_dir, '.wiki_state.json')
     state = load_state(state_path) if not args.force else {}
 
-    succeeded, skipped, failed, metadata_list = [], [], [], []
+    # --index-only: rebuild outputs from the cache and stop.
+    if args.index_only:
+        done, _, index_path = _rebuild_outputs(pdf_files, state, wiki_dir)
+        print(f"Rebuilt outputs from cache: {len(done)}/{len(pdf_files)} inputs present.")
+        print(f"  Index: {index_path}  (+ index.csv / index.json)")
+        return
+
+    print(f"Found {len(pdf_files)} PDF files.\n")
+
+    start = time.monotonic()
+    succeeded, skipped, failed, failed_keys = [], [], [], set()
+    budget_hit = False
 
     for i, pdf_path in enumerate(pdf_files, 1):
         pdf_filename = os.path.basename(pdf_path)
-        md_filename = sanitise_filename(pdf_filename)
-        output_path = os.path.join(papers_dir, md_filename)
-
+        key = _state_key(pdf_path)
         current_hash = file_hash(pdf_path)
-        cached = state.get(pdf_path)
+        cached = state.get(key)
         if (cached and cached.get('hash') == current_hash and not args.force
                 and cached.get('metadata')):
-            metadata_list.append(cached['metadata'])
             skipped.append(pdf_filename)
             print(f"  [{i}/{len(pdf_files)}] SKIP (unchanged): {pdf_filename}")
             continue
 
+        # Time budget: stop before STARTING a new conversion once spent. Cached
+        # files above are cheap and keep advancing; only new work is gated.
+        if (args.time_budget is not None
+                and time.monotonic() - start >= args.time_budget):
+            budget_hit = True
+            print(f"  [{i}/{len(pdf_files)}] time budget reached "
+                  f"({args.time_budget:g}s) — deferring remaining files")
+            break
+
+        md_filename = sanitise_filename(pdf_filename)
+        output_path = os.path.join(papers_dir, md_filename)
         try:
             meta = convert_one_pdf(pdf_path, output_path, refs_dir, references_mode,
                                    prefer_pdf_title=args.prefer_pdf_title)
             if os.path.getsize(output_path) < 500:
                 print(f"  [{i}/{len(pdf_files)}] WARNING (possible scan, little text): {pdf_filename}")
             else:
-                dt = meta['study_type']
-                print(f"  [{i}/{len(pdf_files)}] OK [{dt}]: {pdf_filename}")
+                print(f"  [{i}/{len(pdf_files)}] OK [{meta['study_type']}]: {pdf_filename}")
             succeeded.append(pdf_filename)
-            metadata_list.append(meta)
-            state[pdf_path] = {'hash': current_hash, 'metadata': meta}
+            state[key] = {'hash': current_hash, 'metadata': meta,
+                          'source_pdf': pdf_filename}
+            save_state(state_path, state)          # persist after EVERY file
         except Exception as e:
             print(f"  [{i}/{len(pdf_files)}] FAILED: {pdf_filename} | Error: {e}")
             failed.append((pdf_filename, str(e)))
+            failed_keys.add(key)
 
     save_state(state_path, state)
 
-    dupe_groups = find_duplicates(metadata_list)
-    index_path = os.path.join(wiki_dir, 'index.md')
-    build_index(metadata_list, index_path, dupe_groups)
-    build_evidence_table(metadata_list,
-                         os.path.join(wiki_dir, 'index.csv'),
-                         os.path.join(wiki_dir, 'index.json'),
-                         dupe_groups)
+    # Build outputs from state — reflects everything converted so far.
+    done, dupe_groups, index_path = _rebuild_outputs(pdf_files, state, wiki_dir)
+
+    done_keys = {_state_key(p) for p in pdf_files
+                 if state.get(_state_key(p), {}).get('metadata')}
+    pending = [os.path.basename(p) for p in pdf_files
+               if _state_key(p) not in done_keys and _state_key(p) not in failed_keys]
 
     print(f"\n{'='*50}")
-    print("  Conversion complete")
+    print("  Conversion pass complete")
     print(f"{'='*50}")
-    print(f"  New/updated: {len(succeeded)}")
-    print(f"  Skipped:     {len(skipped)}")
-    print(f"  Failed:      {len(failed)}")
-    print(f"  Total index: {len(metadata_list)} papers")
+    print(f"  Converted this pass: {len(succeeded)}")
+    print(f"  Skipped (cached):    {len(skipped)}")
+    print(f"  Failed:              {len(failed)}")
+    print(f"  In index (total):    {len(done)}/{len(pdf_files)}")
     print(f"  Wiki:        {wiki_dir}")
-    print(f"  Index:       {index_path}")
-    print(f"  Evidence table: index.csv / index.json")
+    print(f"  Index:       {index_path}  (+ index.csv / index.json)")
     print(f"  References:  {references_mode}")
 
-    # Design breakdown
     counts = {}
-    for m in metadata_list:
+    for m in done:
         counts[m.get('study_type', '?')] = counts.get(m.get('study_type', '?'), 0) + 1
     if counts:
         print("\n  Study designs:")
@@ -1098,13 +1164,20 @@ def main():
         for name, err in failed:
             print(f"    - {name}: {err}")
 
-    total = len(metadata_list)
+    total = len(done)
     pdf_est, idx_est = total * 12000, total * 450
     print("\n  Token estimate:")
     print(f"    Reading all PDFs directly:  ~{pdf_est:,} tokens")
     print(f"    Reading index.md only:      ~{idx_est:,} tokens")
     print(f"    Savings:                    ~{pdf_est - idx_est:,} tokens "
           f"({((pdf_est - idx_est)/max(pdf_est,1))*100:.0f}%)")
+
+    # Resumability signal for supervisors in time-capped sandboxes.
+    if pending:
+        why = "time budget" if budget_hit else "not yet processed"
+        print(f"\n  PENDING {len(pending)} ({why}) — re-run the same command to continue.")
+        sys.exit(0)
+    print("\n  ALL_DONE")
 
 
 if __name__ == '__main__':
