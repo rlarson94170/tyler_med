@@ -86,9 +86,19 @@ python3 -c "import pymupdf4llm, fitz" 2>/dev/null || pip install pymupdf4llm --b
 reading. Report success/failure before continuing.
 
 ### Step 2: Run the conversion script
+The converter `convert.py` is bundled in **this skill's own directory**. Run it by
+its real path — do NOT hardcode `$HOME/.claude/skills/tyler_med/`, because the folder
+name and location differ across environments (the CLI/code environment keeps it at
+`~/.claude/skills/tyler_med/`, but packaged/deployed environments such as Cowork mount
+a read-only, kebab-cased copy like `.../skills/tyler-med/` at a different path). Use
+the **skill base directory** the runtime gives you when this skill loads:
 ```bash
-python3 "$HOME/.claude/skills/tyler_med/convert.py" "PDF_DIR" "WIKI_DIR" [OPTIONS]
+python3 "SKILL_DIR/convert.py" "PDF_DIR" "WIKI_DIR" [OPTIONS]
 ```
+Substitute `SKILL_DIR` with this skill's actual base directory (the folder containing
+this `SKILL.md`). If you're unsure of it, locate the script first, e.g.
+`find "$HOME/.claude" /var/folders /sessions -name convert.py -path '*tyler*med*' 2>/dev/null | head -1`.
+
 **Flags:**
 - `--recursive` / `-r`: scan recursively
 - `--prefer-pdf-title`: trust the PDF's embedded metadata title over the filename
@@ -121,9 +131,10 @@ shell has a hard per-call wall-clock limit and cannot run background processes, 
 command** until the output prints `ALL_DONE` instead of `PENDING n`. Each pass skips
 already-converted files and makes forward progress. Example supervisor loop:
 ```bash
-until python3 "$HOME/.claude/skills/tyler_med/convert.py" "PDF_DIR" "WIKI_DIR" \
+until python3 "SKILL_DIR/convert.py" "PDF_DIR" "WIKI_DIR" \
       --time-budget 30 | tee /dev/stderr | grep -qa ALL_DONE; do :; done
 ```
+(`SKILL_DIR` = this skill's base directory, as in Step 2.)
 In the code environment (no wall-clock cap), omit `--time-budget` and it runs in one
 pass as before.
 
