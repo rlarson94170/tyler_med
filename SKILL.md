@@ -120,6 +120,10 @@ this `SKILL.md`). If you're unsure of it, locate the script first, e.g.
   exceed a per-call time budget — title/DOI/abstract/study_type come from the front
   matter, so the entry is still correct; only the tail (appendices, full references)
   is dropped.
+- `--keyword-tags`: also emit one Obsidian tag per author keyword. **Off by default**
+  — keyword tags flood the tag pane/graph and add little over the `keywords:`
+  frontmatter field. By default `tags:` stays limited to the controlled `design/…`,
+  `source/…`, and `year/…` namespaces (clean, queryable, graph-friendly).
 
 The script automatically: finds PDFs (skips unchanged), converts via pymupdf4llm,
 reads embedded metadata + DOI, repairs mojibake, extracts clinical metadata,
@@ -166,10 +170,34 @@ Then explain future use:
 > the index — I'll read individual `papers/*.md` files only when I need full text.
 > Grep across `papers/` for specific terms.
 
-### Step 4 (optional): Enrich the index with Claude
-Only if the user asks: add a one-line contribution note per paper, build a
-thematic (topic) grouping to complement the by-design grouping, or draft a
-narrative synthesis / evidence-table rows from the abstracts.
+### Step 4 (optional): Build `index_by_theme.md` — the thematic index
+`convert.py` only emits the by-**design** `index.md`. A by-**topic** index is the
+most useful artifact for actually writing (design grouping answers "what's the
+evidence level"; theme grouping answers "what do I cite for point X"). It is a
+Claude-authored layer — run it on request, per vault. **Only worth it when the
+papers genuinely cluster into ≥3 themes** — skip it for a single-topic vault.
+
+Routine (mirrors the format of the hand-built `Reasmissions/index_by_theme.md`):
+1. Read `index.json` (titles, year, journal, study_type, doi) — that's the whole
+   corpus cheaply. Read individual `papers/*.md` abstracts only where you need more
+   than the title to place or summarize a paper.
+2. Group papers into coherent clinical **themes** (name each theme + a one-line
+   scope). File each paper under its **primary** theme; note cross-cutting ones
+   with *(see also …)*.
+3. For each entry write: a **study-design badge** (e.g. `` `COHORT` ``, `` `RCT` ``,
+   `` `SR+MA` ``, `` `GUIDELINE` ``) from `study_type`, the `[[wikilink]]` (= the
+   paper's md filename without `.md`), `(year, journal)`, and a **one-line
+   contribution note** (what *this* paper adds, not just its abstract).
+4. Flag near-duplicate papers (⚠️) so the reader knows to read only one.
+5. Header: link to `index.md` / `index.csv`; a theme table-of-contents; a badge
+   legend. Write to `WIKI_DIR/index_by_theme.md`.
+6. Validate every `[[wikilink]]` resolves to a real file in `papers/` before finishing.
+
+Other optional enrichments on request: a one-line contribution note appended per
+`index.md` entry, or a drafted narrative synthesis / evidence-table rows.
+
+**Keep hand annotations in `index_by_theme.md` or separate linked notes — never in
+`papers/*.md`**, because re-running `convert.py` overwrites the paper frontmatter.
 
 ## Gotchas and known issues
 - **Scanned PDFs & OCR**: with `--ocr auto` (default) the script samples each PDF's

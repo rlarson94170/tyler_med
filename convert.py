@@ -141,6 +141,18 @@ def repair_text(text):
     for bad, good in _SYMBOL_FIX.items():
         if bad in text:
             text = text.replace(bad, good)
+    # U+FFFD (the replacement char, �) is what PyMuPDF emits when it fails to
+    # decode the same glyph that elsewhere becomes '¼'. It is ambiguous in
+    # isolation, so repair it only in unambiguous statistical contexts and leave
+    # any remaining bare � untouched (don't guess).
+    if '�' in text:
+        text = re.sub(r'([nN])\s*�\s*(?=[.\d])', r'\1 = ', text)  # N � 23,268 -> N = 23,268
+        text = re.sub(r'(\b(?:age|as|of|than|least|>=|≥)\s*)�(?=\s*\d)', r'\1≥ ', text)  # age �18 / as � 80%
+        text = re.sub(r'�(?=\s?\d[\d,]*\s?%)', '≥ ', text)          # �80% -> ≥ 80% (at-least threshold)
+        text = re.sub(r'\bmean\s*�\s*(?=SD|\d)', 'mean ± ', text, flags=re.IGNORECASE)  # mean �SD -> mean ± SD
+        text = re.sub(r'�\s*-?\s*blocker', 'β-blocker', text, flags=re.IGNORECASE)      # �-blockers -> β-blockers
+        # Any remaining bare � (word-internal ti/tt, P-value < vs =, ± in tables,
+        # ~$ in ranges) is a genuinely ambiguous glyph collapse — leave it, don't guess.
     # Normalise to composed form so accents render as single code points.
     text = unicodedata.normalize('NFC', text)
     return text
@@ -293,10 +305,26 @@ CREDENTIALS = re.compile(
     r'\b(?:MD|PhD|DO|MBBS|MBChB|MSc|MS|MPH|MBA|BSc|BS|BA|RN|NP|PA-C|CRNP|CNL|'
     r'FACS|FRCS|FRCR|FACC|FAHA|FESC|FEBVS|DPhil|PharmD|DrPH|ScD|DPM|MHS|RPVI)\b')
 
+# Affiliation signature — a line matching this is an institution/address, not a
+# byline of names, and must not be captured as authors.
+AFFIL = re.compile(r'Department|Division|Universit|Hospital|Centre|Center|College|'
+                   r'Institute|School of|Faculty|Clinic\b|Medical Cent|Laborator|'
+                   r'Foundation', re.IGNORECASE)
+
+
+def _looks_like_authors(s):
+    """True if a string reads like a byline of names, not an affiliation/other."""
+    if not s or len(s) < 4 or len(s) > 600:
+        return False
+    if AFFIL.search(s) and ',' not in s:
+        return False
+    return bool(re.search(r'[A-Z][a-z]+', s))  # at least one capitalised name
+
 
 def clean_authors(text):
     """Clean a medical author byline; collapse affiliation markers to ';'."""
     text = re.sub(r'\*\*?|__?', '', text)
+    text = re.sub(r'^\s*>?\s*[a-z]\s+(?=[A-Z])', '', text)  # orphan superscript "a " marker
     text = re.sub(r'\s*,?\s*(?:\[[^\]]{1,8}\])+', '; ', text)
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r';\s*;', '; ', text)
@@ -331,10 +359,21 @@ def extract_authors(md_text, title):
             break
         if CREDENTIALS.search(s) and len(s) < 400:
             block = s
-            if i + 1 < len(lines_all):
-                nxt = lines_all[i + 1].strip().strip('#*_ ').strip()
-                if nxt and CREDENTIALS.search(nxt) and len(nxt) < 400:
+            # Extend across a multi-line byline: keep appending following lines
+            # while they still read like names/credentials and haven't hit an
+            # affiliation block or the abstract.
+            j = i + 1
+            while j < len(lines_all) and j <= i + 3:
+                nxt = lines_all[j].strip().strip('#*_ ').strip()
+                if (not nxt or is_junk_line(nxt) or '@' in nxt or AFFIL.search(nxt)
+                        or re.match(r'^(abstract|summary|introduction|background)\b',
+                                    nxt, re.IGNORECASE)):
+                    break
+                if CREDENTIALS.search(nxt) or re.search(r'[A-Z][a-z]+\s+[A-Z]', nxt):
                     block += ' ' + nxt
+                    j += 1
+                else:
+                    break
             authors = clean_authors(block)
             if len(authors) > 4:
                 return authors
@@ -360,6 +399,10 @@ def extract_authors(md_text, title):
         if re.match(r'^\d{4}', line):
             break
         if '@' in line and ',' not in line:
+            continue
+        # Skip affiliation/address lines (Department, University, Hospital, …) and
+        # orphan superscript-marker lines like "> a Department of ...".
+        if AFFIL.search(line):
             continue
         if 5 < len(line) <= 200:
             candidates.append(clean_field(line))
@@ -467,6 +510,12 @@ def extract_keywords(md_text):
     if m:
         kw = re.sub(r'\s+', ' ', m.group(1).strip())
         kw = kw.strip(' *:;–-')  # drop leading bold/label artefacts
+        # Cut journal boilerplate that bleeds past the real keyword list
+        # (e.g. "... Registries Article history: Received 16 December 2018 ...").
+        kw = re.split(r'\s*(?:Article history|Received\b|Accepted\b|Available online|'
+                      r'©|Crown copyright|doi:|https?:)', kw,
+                      maxsplit=1, flags=re.IGNORECASE)[0]
+        kw = kw.strip(' *:;,.–-')
         return kw[:500]
     return ""
 
@@ -573,7 +622,13 @@ def extract_sample_size(abstract, body):
         cands.append(int(m.group(1).replace(',', '')))
     for m in re.finditer(r'(?:total of|included|identified|enrolled|comprising|'
                          r'analy[sz]ed)\s+([\d][\d,]{2,8})\s+(?:patients|'
-                         r'participants|admissions|procedures|cases|operations)',
+                         r'participants|admissions|procedures|cases|operations|'
+                         r'records|hospitali[sz]ations|encounters|limbs)',
+                         text, re.IGNORECASE):
+        cands.append(int(m.group(1).replace(',', '')))
+    # "23,268 patients were …" / "440 limbs underwent …" (N stated before the noun)
+    for m in re.finditer(r'\b([\d][\d,]{2,8})\s+(?:patients|limbs|admissions|records|'
+                         r'procedures)\s+(?:were|underwent|had|met|with)',
                          text, re.IGNORECASE):
         cands.append(int(m.group(1).replace(',', '')))
     cands = [c for c in cands if 5 <= c <= 50_000_000]
@@ -640,14 +695,16 @@ def slugify_tag(text):
     return text
 
 
-def build_tags(keywords, design, data_sources):
-    """Build Obsidian tags from keywords + study design + data sources."""
+def build_tags(keywords, design, data_sources, year=None, keyword_tags=False):
+    """Build Obsidian tags.
+
+    By default only the controlled `design/…`, `source/…`, and `year/…` namespaces
+    are emitted. Per-keyword hashtags are deliberately omitted: they flood the
+    Obsidian tag pane and graph and add little over the human-readable `keywords:`
+    frontmatter field (which is kept). Set keyword_tags=True (CLI: --keyword-tags)
+    to also emit one slugified tag per keyword.
+    """
     tags = []
-    if keywords:
-        for kw in re.split(r'[;,]', keywords):
-            t = slugify_tag(kw)
-            if t and len(t) >= 2:
-                tags.append(t)
     if design:
         t = slugify_tag(design.split('/')[0])
         if t:
@@ -656,6 +713,13 @@ def build_tags(keywords, design, data_sources):
         t = slugify_tag(ds)
         if t:
             tags.append('source/' + t)
+    if year and str(year).isdigit():
+        tags.append('year/' + str(year))
+    if keyword_tags and keywords:
+        for kw in re.split(r'[;,]', keywords):
+            t = slugify_tag(kw)
+            if t and len(t) >= 2:
+                tags.append(t)
     seen, out = set(), []
     for t in tags:
         if t not in seen:
@@ -716,7 +780,8 @@ def split_references(md_text):
 # ---------------------------------------------------------------------------
 
 def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separate',
-                    prefer_pdf_title=False, ocr_mode='auto', max_pages=None):
+                    prefer_pdf_title=False, ocr_mode='auto', max_pages=None,
+                    keyword_tags=False):
     """Convert a single PDF to cleaned markdown + YAML frontmatter.
 
     references_mode: 'separate' (default, write to refs_dir), 'inline' (keep in
@@ -783,9 +848,15 @@ def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separ
     year = fname_meta.get('year') or extract_year(md_text, original_filename)
     doi = emb_doi or find_doi(page1) or find_doi(md_text[:6000])
 
-    authors = extract_authors(md_text, title)
-    if authors in ('Unknown', '') and emb_author:
+    # Prefer the PDF's embedded author list when it reads like real names — it is
+    # cleaner and more complete than scraping a two-column byline. Fall back to
+    # text extraction (then to embedded, even if imperfect) otherwise.
+    if emb_author and _looks_like_authors(emb_author):
         authors = emb_author
+    else:
+        authors = extract_authors(md_text, title)
+        if authors in ('Unknown', '') and emb_author:
+            authors = emb_author
 
     abstract = extract_abstract(md_text)
     keywords = extract_keywords(md_text)
@@ -799,7 +870,8 @@ def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separ
     sample_size = extract_sample_size(abstract, body)
     data_sources = extract_data_sources(abstract, body)
     registration = extract_registration(abstract, body)
-    tags = build_tags(keywords, design, data_sources)
+    tags = build_tags(keywords, design, data_sources, year=year,
+                      keyword_tags=keyword_tags)
 
     # References handling
     refs_file = ''
@@ -1124,6 +1196,11 @@ def main():
                         '(records the truncation in the paper frontmatter). Use for '
                         'oversized documents whose full conversion would exceed a '
                         'per-call time budget.')
+    p.add_argument('--keyword-tags', action='store_true',
+                   help='Also emit one Obsidian tag per author keyword. Off by '
+                        'default: keyword tags flood the tag pane/graph, and the '
+                        'human-readable keywords: frontmatter field is kept anyway. '
+                        'Tags stay limited to design/…, source/…, and year/….')
     args = p.parse_args()
 
     # Preflight: required libraries (fail fast with an actionable message).
@@ -1220,7 +1297,8 @@ def main():
             current_hash = file_hash(pdf_path)   # hash only files we actually convert
             meta = convert_one_pdf(pdf_path, output_path, refs_dir, references_mode,
                                    prefer_pdf_title=args.prefer_pdf_title,
-                                   ocr_mode=args.ocr, max_pages=args.max_pages)
+                                   ocr_mode=args.ocr, max_pages=args.max_pages,
+                                   keyword_tags=args.keyword_tags)
             if os.path.getsize(output_path) < 500:
                 print(f"  [{i}/{len(pdf_files)}] WARNING (possible scan, little text): {pdf_filename}")
             else:

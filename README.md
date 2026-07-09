@@ -65,11 +65,50 @@ python3 convert.py "PDF_DIR" "WIKI_DIR" [OPTIONS]
   editorial). A named registry in the title (NSQIP, VQI, Medicare, …) implies a
   cohort; an explicit `EDITORIAL` tag in a title is honoured.
 - **Structured metadata:** DOI, sample size (`n=`), data source, trial/PROSPERO
-  registration IDs, MeSH-style + `design/…` / `source/…` tags.
+  registration IDs, and clean controlled tags.
 - **Duplicate detection** (shared DOI or year+title) with `⚠️DUP-n` flags.
 
 > **Note:** study design, sample size, and data source are heuristic (best-effort
 > from the abstract). Verify anything load-bearing against the full text.
+
+## Using it as an Obsidian vault
+
+Open `WIKI_DIR` in Obsidian (or drop it into an existing vault). Each `papers/*.md`
+carries YAML frontmatter that becomes note **properties**, and the index links every
+paper with `[[wikilinks]]`.
+
+**Tags are deliberately minimal and controlled** — only three nested namespaces, so
+the tag pane and graph stay clean and queryable:
+
+- `design/…` — study design (e.g. `design/cohort-study`, `design/randomized-controlled-trial`)
+- `source/…` — data source (e.g. `source/nsqip`, `source/vqi`, `source/medicare/cms`)
+- `year/…` — publication year (e.g. `year/2023`)
+
+Per-keyword hashtags are **off by default** (they flood the graph); the human-readable
+`keywords:` property is kept regardless. Pass `--keyword-tags` if you want them.
+
+**Dataview** turns the frontmatter into a live evidence table. Examples:
+
+````md
+```dataview
+TABLE study_type AS Design, year AS Year, sample_size AS N, journal
+FROM "papers"
+WHERE contains(data_source, "VQI")
+SORT year DESC
+```
+````
+
+````md
+```dataview
+TABLE WITHOUT ID link(file.link, title) AS Paper, doi
+FROM #design/randomized-controlled-trial
+SORT year DESC
+```
+````
+
+For a **by-topic** view (what to cite for a given point), ask Claude to build
+`index_by_theme.md` (see Step 4 in `SKILL.md`) — a curated thematic grouping with a
+design badge and one-line contribution note per paper.
 
 ## Acknowledgements
 
