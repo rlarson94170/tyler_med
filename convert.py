@@ -73,6 +73,38 @@ def file_hash(path):
     return h.hexdigest()
 
 
+def file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _file_sig(path):
+    """Cheap change signature: (size, mtime). No file read."""
+    st = os.stat(path)
+    return st.st_size, st.st_mtime
+
+
+def entry_unchanged(path, entry):
+    """Decide whether an already-converted file can be skipped WITHOUT hashing.
+
+    Fast path: cached size + mtime match the file on disk -> unchanged. This is
+    what lets a resume pass dismiss hundreds of cached PDFs in microseconds
+    instead of SHA-256-ing every one. Only when size/mtime differ (or are absent
+    on a legacy cache entry) do we fall back to a content hash, so a mere `touch`
+    does not trigger a needless re-conversion."""
+    if not entry or not entry.get('metadata'):
+        return False
+    try:
+        size, mtime = _file_sig(path)
+    except OSError:
+        return False
+    if entry.get('size') == size and entry.get('mtime') == mtime:
+        return True
+    return bool(entry.get('hash')) and entry['hash'] == file_hash(path)
+
+
 # ---------------------------------------------------------------------------
 # Text repair: ligatures + mojibake (Tier 1)
 # ---------------------------------------------------------------------------
@@ -684,7 +716,7 @@ def split_references(md_text):
 # ---------------------------------------------------------------------------
 
 def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separate',
-                    prefer_pdf_title=False, ocr_mode='auto'):
+                    prefer_pdf_title=False, ocr_mode='auto', max_pages=None):
     """Convert a single PDF to cleaned markdown + YAML frontmatter.
 
     references_mode: 'separate' (default, write to refs_dir), 'inline' (keep in
@@ -703,12 +735,30 @@ def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separ
         use_ocr = False
     else:  # 'auto'
         use_ocr = _pdf_needs_ocr(pdf_path)
+
+    # Optional page cap for oversized documents (e.g. a 200+ page review whose
+    # full conversion would exceed a per-call time budget). The metadata we care
+    # about lives in the front matter, so converting only the first N pages still
+    # yields a correct title/DOI/abstract/study_type; the truncation is recorded.
+    total_pages = None
+    pages_arg = None
+    if max_pages and max_pages > 0:
+        try:
+            import fitz
+            with fitz.open(pdf_path) as _d:
+                total_pages = _d.page_count
+            if total_pages and total_pages > max_pages:
+                pages_arg = list(range(max_pages))
+        except Exception:
+            pages_arg = None
+    extra = {'pages': pages_arg} if pages_arg is not None else {}
     try:
-        raw = pymupdf4llm.to_markdown(pdf_path, use_ocr=use_ocr)
+        raw = pymupdf4llm.to_markdown(pdf_path, use_ocr=use_ocr, **extra)
     except TypeError:
         # Older/classic pymupdf4llm engine has no `use_ocr` kwarg (and does not
-        # OCR on its own) — fall back to the plain call.
-        raw = pymupdf4llm.to_markdown(pdf_path)
+        # OCR on its own) — fall back without it (still honours `pages`).
+        raw = pymupdf4llm.to_markdown(pdf_path, **extra)
+    truncated = pages_arg is not None
     md_text = repair_text(raw)
     original_filename = os.path.basename(pdf_path)
 
@@ -785,6 +835,10 @@ def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separ
     fm.append(f'source_pdf: {yaml_dq(original_filename)}')
     if refs_file:
         fm.append(f'references_file: {yaml_dq("references/" + refs_file)}')
+    if truncated:
+        fm.append('truncated: true')
+        fm.append(f'pages_converted: "{len(pages_arg)}"')
+        fm.append(f'total_pages: "{total_pages}"')
     fm.append('---')
     fm.append('')
 
@@ -812,6 +866,9 @@ def convert_one_pdf(pdf_path, output_path, refs_dir=None, references_mode='separ
         'md_filename': os.path.basename(output_path),
         'references_file': ('references/' + refs_file) if refs_file else '',
         'body_tokens_approx': len(body.split()),
+        'truncated': truncated,
+        'pages_converted': (len(pages_arg) if truncated else None),
+        'total_pages': total_pages,
     }
 
 
@@ -1062,6 +1119,11 @@ def main():
     p.add_argument('--index-only', action='store_true',
                    help='Do not convert; just rebuild index.md + evidence table '
                         'from the existing .wiki_state.json cache, then exit.')
+    p.add_argument('--max-pages', type=int, default=None, metavar='N',
+                   help='Convert only the first N pages of any PDF longer than N '
+                        '(records the truncation in the paper frontmatter). Use for '
+                        'oversized documents whose full conversion would exceed a '
+                        'per-call time budget.')
     args = p.parse_args()
 
     # Preflight: required libraries (fail fast with an actionable message).
@@ -1099,7 +1161,9 @@ def main():
     if not pdf_files:
         print(f"No PDF files found in: {pdf_dir}")
         sys.exit(0)
-    pdf_files.sort()
+    # Process smallest files first, so one oversized PDF cannot starve many quick
+    # ones inside a time-budget window.
+    pdf_files.sort(key=lambda p: (file_size(p), p))
 
     state_path = os.path.join(wiki_dir, '.wiki_state.json')
     state = load_state(state_path) if not args.force else {}
@@ -1111,6 +1175,12 @@ def main():
         print(f"  Index: {index_path}  (+ index.csv / index.json)")
         return
 
+    if args.force and args.time_budget is not None:
+        print("  NOTE: --force re-converts every file each pass, so with "
+              "--time-budget it will NOT converge under a budget.\n"
+              "        For a resumable full rebuild, use --force on the FIRST pass "
+              "only, then re-run WITHOUT --force.\n")
+
     print(f"Found {len(pdf_files)} PDF files.\n")
 
     start = time.monotonic()
@@ -1120,16 +1190,22 @@ def main():
     for i, pdf_path in enumerate(pdf_files, 1):
         pdf_filename = os.path.basename(pdf_path)
         key = _state_key(pdf_path)
-        current_hash = file_hash(pdf_path)
         cached = state.get(key)
-        if (cached and cached.get('hash') == current_hash and not args.force
-                and cached.get('metadata')):
+
+        # Cheap skip: dismiss already-converted, unchanged files WITHOUT hashing
+        # (size + mtime match). This is what lets a resume pass reach real work
+        # instead of spending its whole budget re-hashing the cache.
+        if not args.force and entry_unchanged(pdf_path, cached):
+            if 'size' not in cached or 'mtime' not in cached:
+                try:  # backfill legacy entries so later passes skip instantly
+                    cached['size'], cached['mtime'] = _file_sig(pdf_path)
+                except OSError:
+                    pass
             skipped.append(pdf_filename)
             print(f"  [{i}/{len(pdf_files)}] SKIP (unchanged): {pdf_filename}")
             continue
 
-        # Time budget: stop before STARTING a new conversion once spent. Cached
-        # files above are cheap and keep advancing; only new work is gated.
+        # Time budget: stop before STARTING new work. Cheap skips above already ran.
         if (args.time_budget is not None
                 and time.monotonic() - start >= args.time_budget):
             budget_hit = True
@@ -1140,16 +1216,19 @@ def main():
         md_filename = sanitise_filename(pdf_filename)
         output_path = os.path.join(papers_dir, md_filename)
         try:
+            size, mtime = _file_sig(pdf_path)
+            current_hash = file_hash(pdf_path)   # hash only files we actually convert
             meta = convert_one_pdf(pdf_path, output_path, refs_dir, references_mode,
                                    prefer_pdf_title=args.prefer_pdf_title,
-                                   ocr_mode=args.ocr)
+                                   ocr_mode=args.ocr, max_pages=args.max_pages)
             if os.path.getsize(output_path) < 500:
                 print(f"  [{i}/{len(pdf_files)}] WARNING (possible scan, little text): {pdf_filename}")
             else:
-                print(f"  [{i}/{len(pdf_files)}] OK [{meta['study_type']}]: {pdf_filename}")
+                trunc = " ✂trunc" if meta.get('truncated') else ""
+                print(f"  [{i}/{len(pdf_files)}] OK [{meta['study_type']}]{trunc}: {pdf_filename}")
             succeeded.append(pdf_filename)
-            state[key] = {'hash': current_hash, 'metadata': meta,
-                          'source_pdf': pdf_filename}
+            state[key] = {'hash': current_hash, 'size': size, 'mtime': mtime,
+                          'metadata': meta, 'source_pdf': pdf_filename}
             save_state(state_path, state)          # persist after EVERY file
         except Exception as e:
             print(f"  [{i}/{len(pdf_files)}] FAILED: {pdf_filename} | Error: {e}")

@@ -114,6 +114,12 @@ this `SKILL.md`). If you're unsure of it, locate the script first, e.g.
   with a `PENDING n` line (for time-capped sandboxes — see below)
 - `--index-only`: skip conversion, just rebuild `index.md` + evidence table from the
   cache
+- `--max-pages N`: convert only the first N pages of any PDF longer than N (records
+  `truncated: true` + `pages_converted` / `total_pages` in that paper's frontmatter).
+  Use for oversized documents (e.g. a 200+ page review) whose full conversion would
+  exceed a per-call time budget — title/DOI/abstract/study_type come from the front
+  matter, so the entry is still correct; only the tail (appendices, full references)
+  is dropped.
 
 The script automatically: finds PDFs (skips unchanged), converts via pymupdf4llm,
 reads embedded metadata + DOI, repairs mojibake, extracts clinical metadata,
@@ -128,13 +134,22 @@ saved to `.wiki_state.json` after *every* file, and the index is rebuilt from th
 state each pass, so a run can be interrupted and resumed without losing work. When a
 shell has a hard per-call wall-clock limit and cannot run background processes, pass
 `--time-budget` (e.g. a value comfortably under the cap) and **re-run the exact same
-command** until the output prints `ALL_DONE` instead of `PENDING n`. Each pass skips
-already-converted files and makes forward progress. Example supervisor loop:
+command** until the output prints `ALL_DONE` instead of `PENDING n`. Already-converted
+files are skipped cheaply (by size+mtime, no re-hashing), so every pass spends its
+budget on real work and the run converges. Example supervisor loop:
 ```bash
 until python3 "SKILL_DIR/convert.py" "PDF_DIR" "WIKI_DIR" \
       --time-budget 30 | tee /dev/stderr | grep -qa ALL_DONE; do :; done
 ```
 (`SKILL_DIR` = this skill's base directory, as in Step 2.)
+
+**Do NOT put `--force` in the resume loop** — `--force` re-converts every file each
+pass and will never converge under a budget (the script warns if you combine them).
+For a resumable *full rebuild*, use `--force` on the **first pass only**, then re-run
+the loop **without** it. And if a single document is so large that even one file's
+conversion exceeds the per-call cap, add `--max-pages N` so it can be checkpointed
+within one call.
+
 In the code environment (no wall-clock cap), omit `--time-budget` and it runs in one
 pass as before.
 
