@@ -1118,10 +1118,26 @@ def build_evidence_table(metadata_list, csv_path, json_path, dupe_groups):
 # ---------------------------------------------------------------------------
 
 def load_state(state_path):
-    if os.path.exists(state_path):
-        with open(state_path, 'r') as f:
-            return json.load(f)
-    return {}
+    if not os.path.exists(state_path):
+        return {}
+    with open(state_path, 'r') as f:
+        raw = json.load(f)
+    # Migrate legacy absolute-path keys (or any non-canonical key) to the stable
+    # md-filename key, so caches written by an earlier version / a prior session
+    # still match. Idempotent: an already-stable key maps to itself.
+    migrated = {}
+    for k, v in raw.items():
+        nk = k
+        if isinstance(v, dict):
+            md = (v.get('metadata') or {}).get('md_filename')
+            if md:
+                nk = md
+            elif v.get('source_pdf'):
+                nk = _state_key(v['source_pdf'])
+            elif ('/' in k or os.sep in k):
+                nk = _state_key(k)
+        migrated[nk] = v
+    return migrated
 
 
 def save_state(state_path, state):
@@ -1134,31 +1150,50 @@ def save_state(state_path, state):
 # ---------------------------------------------------------------------------
 
 def _state_key(pdf_path):
-    """Stable, normalized state key (absolute path) so different path forms for
-    the same file don't create duplicate/stale cache entries across environments."""
-    return os.path.abspath(pdf_path)
+    """Stable state key = the sanitized output (.md) filename derived from the
+    PDF's basename. Invariant to the absolute path, so a prior session's cache
+    still matches even when the workspace re-mounts under a new root each session
+    (as in sandboxes). Keyed on identity, not location — an absolute-path key
+    guarantees a miss the moment the mount root changes."""
+    return sanitise_filename(os.path.basename(pdf_path))
 
 
-def _done_metadata(pdf_files, state):
-    """Metadata for the current inputs already converted, read from state."""
+def _all_metadata(state):
+    """Every converted paper's metadata from state (title-bearing). The index must
+    reflect the WHOLE wiki — everything ever converted into this wiki_dir — NOT just
+    the folder enumerated this run. Filtering to the current run's inputs would
+    silently drop every other paper from the index when you add one folder."""
     out = []
-    for p in pdf_files:
-        entry = state.get(_state_key(p))
-        if entry and entry.get('metadata'):
+    for entry in state.values():
+        if isinstance(entry, dict) and (entry.get('metadata') or {}).get('title'):
             out.append(entry['metadata'])
     return out
 
 
-def _rebuild_outputs(pdf_files, state, wiki_dir):
-    """Idempotent (re)build of index.md + evidence table from state. Because it
-    reads from state, it reflects everything converted so far and works after a
-    partial or resumed run."""
-    done = _done_metadata(pdf_files, state)
+def _rebuild_outputs(state, wiki_dir):
+    """Idempotent (re)build of index.md + evidence table from ALL cached metadata
+    in state (the whole wiki). Additive by design: re-running per folder unions the
+    new papers into the existing index; use --force for a clean single-folder
+    rebuild (which wipes state first)."""
+    done = _all_metadata(state)
     dupes = find_duplicates(done)
     index_path = os.path.join(wiki_dir, 'index.md')
     build_index(done, index_path, dupes)
     build_evidence_table(done, os.path.join(wiki_dir, 'index.csv'),
                          os.path.join(wiki_dir, 'index.json'), dupes)
+    # Guardrail against a silent de-sync: the index should cover every paper file
+    # on disk. If it has fewer, the state is stale/foreign — say so loudly rather
+    # than shipping a shrunken index.
+    papers_dir = os.path.join(wiki_dir, 'papers')
+    try:
+        n_files = sum(1 for f in os.listdir(papers_dir) if f.endswith('.md'))
+    except OSError:
+        n_files = 0
+    if n_files and len(done) < n_files:
+        print(f"  ⚠️  WARNING: index has {len(done)} entries but {n_files} paper "
+              f"file(s) exist in papers/ — {n_files - len(done)} not represented in "
+              f".wiki_state.json. Re-run conversion on their source folder to "
+              f"re-cache them (papers/*.md are never deleted).")
     return done, dupes, index_path
 
 
@@ -1228,6 +1263,18 @@ def main():
     refs_dir = os.path.join(wiki_dir, 'references')
     os.makedirs(papers_dir, exist_ok=True)
 
+    state_path = os.path.join(wiki_dir, '.wiki_state.json')
+    state = load_state(state_path) if not args.force else {}
+
+    # --index-only: rebuild the index/evidence table from the cache alone — no PDF
+    # enumeration required. This is the documented recovery path, so it must not
+    # depend on any PDFs being present in pdf_dir.
+    if args.index_only:
+        done, _, index_path = _rebuild_outputs(state, wiki_dir)
+        print(f"Rebuilt index from cache: {len(done)} paper(s) in wiki.")
+        print(f"  Index: {index_path}  (+ index.csv / index.json)")
+        return
+
     if args.recursive:
         pdf_files = [os.path.abspath(os.path.join(root, f))
                      for root, _, files in os.walk(pdf_dir)
@@ -1241,16 +1288,6 @@ def main():
     # Process smallest files first, so one oversized PDF cannot starve many quick
     # ones inside a time-budget window.
     pdf_files.sort(key=lambda p: (file_size(p), p))
-
-    state_path = os.path.join(wiki_dir, '.wiki_state.json')
-    state = load_state(state_path) if not args.force else {}
-
-    # --index-only: rebuild outputs from the cache and stop.
-    if args.index_only:
-        done, _, index_path = _rebuild_outputs(pdf_files, state, wiki_dir)
-        print(f"Rebuilt outputs from cache: {len(done)}/{len(pdf_files)} inputs present.")
-        print(f"  Index: {index_path}  (+ index.csv / index.json)")
-        return
 
     if args.force and args.time_budget is not None:
         print("  NOTE: --force re-converts every file each pass, so with "
@@ -1315,8 +1352,8 @@ def main():
 
     save_state(state_path, state)
 
-    # Build outputs from state — reflects everything converted so far.
-    done, dupe_groups, index_path = _rebuild_outputs(pdf_files, state, wiki_dir)
+    # Build outputs from state — reflects the WHOLE wiki, not just this run.
+    done, dupe_groups, index_path = _rebuild_outputs(state, wiki_dir)
 
     done_keys = {_state_key(p) for p in pdf_files
                  if state.get(_state_key(p), {}).get('metadata')}
@@ -1329,7 +1366,7 @@ def main():
     print(f"  Converted this pass: {len(succeeded)}")
     print(f"  Skipped (cached):    {len(skipped)}")
     print(f"  Failed:              {len(failed)}")
-    print(f"  In index (total):    {len(done)}/{len(pdf_files)}")
+    print(f"  In index (total):    {len(done)} paper(s) in wiki")
     print(f"  Wiki:        {wiki_dir}")
     print(f"  Index:       {index_path}  (+ index.csv / index.json)")
     print(f"  References:  {references_mode}")

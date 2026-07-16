@@ -105,15 +105,18 @@ this `SKILL.md`). If you're unsure of it, locate the script first, e.g.
   (best for older, badly-named files)
 - `--keep-references`: keep references inline in each paper file
 - `--drop-references`: discard references entirely (default: save to `references/`)
-- `--force`: re-convert everything, ignoring the incremental cache
+- `--force`: wipe the cache and re-convert everything; the rebuilt index then
+  contains **only** the files enumerated this run (use it for a clean single-folder
+  rebuild). Without `--force` the index is **additive** — see "Adding papers" below.
 - `--ocr {auto,off,force}`: OCR policy (default `auto`). `auto` OCRs only PDFs that
   lack an adequate text layer, so born-digital journal PDFs skip the slow Tesseract
   pass (~4-5x faster per file, identical extraction); `off` never OCRs; `force`
   always OCRs. Use `off` for a known born-digital set to go fastest.
 - `--time-budget SECONDS`: stop starting new conversions after SECONDS, then exit 0
   with a `PENDING n` line (for time-capped sandboxes — see below)
-- `--index-only`: skip conversion, just rebuild `index.md` + evidence table from the
-  cache
+- `--index-only`: don't convert — rebuild `index.md` + evidence table from the
+  `.wiki_state.json` cache alone (no PDFs need to be present in `PDF_DIR`). This is
+  the recovery path if an index ever looks short: it re-emits **every** cached paper.
 - `--max-pages N`: convert only the first N pages of any PDF longer than N (records
   `truncated: true` + `pages_converted` / `total_pages` in that paper's frontmatter).
   Use for oversized documents (e.g. a 200+ page review) whose full conversion would
@@ -132,6 +135,16 @@ frontmatter, detects duplicates, and builds `index.md` + `index.csv` + `index.js
 
 **Important:** the index and evidence table are built entirely in Python — you do
 NOT need to read individual paper files to build them.
+
+**Adding papers / multi-folder wikis (the index is additive).** A wiki accumulates
+everything ever converted into it. Point the skill at a **new folder** with the
+**same `WIKI_DIR`** and it converts the new PDFs and **unions them into the existing
+index** — previously-indexed papers stay put. The cache is keyed on each paper's
+output filename (not its absolute path), so this holds even across sessions or when
+the workspace re-mounts under a new root. To instead rebuild the index down to *only*
+the current folder, use `--force` (which wipes the cache first). If the index ever
+comes out shorter than the number of files in `papers/`, the script prints a loud
+warning; restore the full index with `--index-only`.
 
 **Resumable runs (time-capped / no-background environments like Cowork):** state is
 saved to `.wiki_state.json` after *every* file, and the index is rebuilt from that
@@ -219,9 +232,12 @@ Other optional enrichments on request: a one-line contribution note appended per
   extraction); a genuine "¼" fraction would be rare collateral.
 - **References** are saved to `references/` by default (not discarded); this costs
   a little disk but preserves citation chasing.
-- **Re-running** is incremental; use `--force` to rebuild. Note: re-running
-  re-derives metadata from the PDF, so manual edits to a paper's frontmatter are
-  overwritten if that PDF changes.
+- **Re-running is incremental and additive** — a new folder unions into the existing
+  index (the cache is keyed on the output filename, stable across sessions/mounts),
+  and the index reflects the *whole* wiki, not just the last folder. `--force` wipes
+  the cache for a clean single-folder rebuild. Re-running re-derives metadata from the
+  PDF, so manual edits to a paper's frontmatter are overwritten if that PDF changes —
+  keep hand annotations in `index_by_theme.md` or separate linked notes.
 
 ## Credit & license
 

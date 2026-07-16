@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.1.2
+
+Data-integrity fix for adding folders to an existing wiki.
+
+- **The index is now additive.** Previously, running a conversion on one folder
+  rebuilt `index.md`/`index.csv`/`index.json` from only *that folder's* papers,
+  silently dropping every other paper from the index (their `papers/*.md` stayed on
+  disk). The index is now rebuilt from **all cached metadata** — the whole wiki — so
+  adding a folder unions into the existing index. `--force` still wipes the cache for
+  a clean single-folder rebuild.
+- **Mount-stable cache keys.** State is keyed on each paper's output filename instead
+  of its absolute path, so a prior session's cache still matches when the workspace
+  re-mounts under a new root (fixes cross-session incremental resume and the recursive
+  rebuild). Legacy absolute-path caches are migrated automatically on load.
+- **`--index-only` needs no PDFs.** The recovery path now rebuilds the full index from
+  `.wiki_state.json` alone, without enumerating any PDFs — so it works even pointed at
+  an empty/foreign folder.
+- **Guardrail.** If the index ends up with fewer entries than the number of paper
+  files on disk, the script prints a loud warning instead of shipping a shrunken index.
+
 ## v0.1.1
 
 Robustness and metadata-quality release.
